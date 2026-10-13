@@ -1,8 +1,8 @@
 # VoiceScribe — Speech-to-Text Web Application
 
 Full-stack speech-to-text app built with **FastAPI** + **faster-whisper** (Whisper ASR), JWT auth,
-SQLAlchemy, WebSocket live transcription, an AI tools layer (Anthropic Claude), and a multi-page
-vanilla-JS frontend.
+SQLAlchemy, WebSocket live transcription, an AI tools layer (Anthropic Claude), and a **React +
+TypeScript** (Vite) frontend.
 
 ## Features
 
@@ -19,8 +19,9 @@ vanilla-JS frontend.
 - **Organization**: favorites, folders, tags, search, filter (language/source/folder/date), sort.
 - **AI tools** (Anthropic Claude, optional): summarize (short/detailed/bullet), meeting notes &
   action items, ask-a-question, rewrite (formal/simple/grammar), speaker analytics.
-- **Multi-page app**: Home, Dashboard, Workspace, History, Profile & Settings, Pricing (UI only —
-  no payment processor wired up), Help/FAQ, Admin dashboard (for admin users).
+- **Multi-page app** (client-side routed with React Router): Home, Dashboard, Workspace, History,
+  Profile & Settings, Pricing (UI only — no payment processor wired up), Help/FAQ, Admin dashboard
+  (for admin users).
 - **Accounts**: email/password auth, optional Google sign-in (needs your own OAuth credentials),
   profile settings, account deletion, rate limiting on auth/transcribe/AI endpoints.
 - **Accessibility**: dark/light/system theme, high-contrast mode, adjustable font size, skip link,
@@ -42,37 +43,50 @@ backend/
     routers/
       auth_router.py     register/login/me/profile/Google sign-in
       transcribe.py        upload/batch/cancel/retry -> background transcription
-      history.py            list/filter/get/update/delete/export transcripts
+      history.py            list/filter/get/audio/update/delete/export transcripts
       stream.py              WebSocket live transcription
       ai.py                    summarize/meeting-notes/ask/rewrite/speaker-analytics
       admin.py                  admin-only stats/users/jobs
     services/
       audio_processing.py  FFmpeg conversion, duration, chunking, speaker-turn heuristic
       whisper_service.py   faster-whisper model wrapper
+      live_transcript.py     incremental assembly of partial/final WebSocket segments
       translation_service.py translation via MyMemory
       export_service.py    TXT/MD/SRT/VTT/DOCX/PDF generation
       ai_service.py           Anthropic Claude wrapper
+  tests/                 pytest suite
   requirements.txt
   Dockerfile
-frontend/
-  index.html                  multi-page shell (hash-routed sections)
-  css/style.css                 theme tokens, dark/light/high-contrast, responsive
-  js/
-    state.js    shared state, API helpers, language list
-    router.js     hash router, theme/contrast/font-size controls
-    auth.js         login/register/profile/Google sign-in
-    workspace.js      live recording + drag-drop/batch upload
-    history.js          list/filters/detail modal/editor/export
-    ai.js                  AI tools panel
-    dashboard.js             stats + recent transcripts
-    admin.js                   admin dashboard
-    app.js                       bootstrap
+frontend/                React 19 + TypeScript, built with Vite
+  index.html
+  src/
+    main.tsx                   entrypoint
+    App.tsx                      router + providers setup
+    routes/                        RequireAuth / RequireAdmin / RedirectIfAuthed guards
+    pages/                           Home, Dashboard, Workspace, History, Profile/Auth,
+                                     Pricing, Help, Admin, NotFound, OAuth-complete
+    components/
+      layout/                         TopBar, MainNav, Footer, UserMenu, A11yControls
+      workspace/                        Dropzone, FileChipList, LiveRecorderPanel, NoiseMeter,
+                                        UploadResultPanel
+      history/                           HistoryFilters, HistoryItem, HistoryListRow
+      detail/                             DetailModal, Editor, SegmentsList, AiPanel,
+                                          OrganizePanel
+      admin/                               UsersTable, JobsTable
+      common/                               Badge, LangSelect, StatTile
+    hooks/                     data fetching (TanStack Query) + live recording/WebSocket logic
+    store/                     Zustand stores (auth, UI, accessibility)
+    lib/                       API client, query client
+    constants/, utils/, types.ts
+  vite.config.ts            dev server + /api and /ws proxy to the backend
 docker-compose.yml
 ```
 
 ## Running locally (without Docker)
 
-Requirements: Python 3.10+, [FFmpeg](https://ffmpeg.org/download.html) on your PATH.
+Requirements: Python 3.10+, Node.js 20+, [FFmpeg](https://ffmpeg.org/download.html) on your PATH.
+
+### Backend
 
 ```bash
 cd backend
@@ -86,11 +100,36 @@ copy .env.example .env         # Windows, or `cp` on macOS/Linux — then edit S
 uvicorn app.main:app --reload --port 8000
 ```
 
-Open the app at **http://localhost:8000/app/** and the interactive API docs at
-**http://localhost:8000/docs**.
-
 The first transcription request will download the chosen Whisper model (default: `base`) via
 faster-whisper/CTranslate2 — this requires an internet connection the first time only.
+
+Run the backend test suite with `pytest` from the `backend` directory.
+
+### Frontend
+
+For day-to-day development, run the Vite dev server in a second terminal — it proxies `/api` and
+`/ws` to the backend on port 8000 (see `frontend/vite.config.ts`) and hot-reloads on save:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open the app at **http://localhost:5173**. The backend's interactive API docs are at
+**http://localhost:8000/docs**.
+
+To serve the frontend from the backend instead (as production/Docker does), build it and let
+`uvicorn` mount the static output:
+
+```bash
+cd frontend
+npm run build
+```
+
+Then open **http://localhost:8000/app/**.
+
+Other frontend scripts: `npm run lint` (oxlint), `npm test` (vitest).
 
 ## Running with Docker
 
@@ -131,6 +170,7 @@ non-destructively on startup — no manual migration step needed for existing da
 - `GET /api/transcripts?search=&language=&source=&folder=&favorite=&date_from=&date_to=&sort_by=`
 - `GET/PUT/PATCH/DELETE /api/transcripts/{id}` — `PUT` replaces the text, `PATCH` updates
   name/favorite/folder/tags
+- `GET /api/transcripts/{id}/audio` — stream the original/converted audio file
 - `GET /api/transcripts/{id}/export?fmt=txt|md|srt|vtt|docx|pdf`
 - `GET /api/transcripts/folders`
 - `POST /api/ai/transcripts/{id}/summarize|meeting-notes|ask|rewrite`,
