@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: voicescribe-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - VOICESCRIBE_SECRET_KEY=${VOICESCRIBE_SECRET_KEY:-change-this-secret-key-in-production}
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-base}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+      - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-int8}
+    volumes:
+      - voicescribe_storage:/app/storage
+    restart: unless-stopped
+
+volumes:
+  voicescribe_storage:
