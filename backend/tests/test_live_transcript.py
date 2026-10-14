@@ -6,7 +6,13 @@ confirmation, overlapping/out-of-order segments, repeated/duplicate segments,
 and segment-boundary offsetting for the bounded trailing-window transcription.
 """
 
-from app.services.live_transcript import CONFIRM_LAG_SECONDS, merge_segments, offset_segments
+from app.services.live_transcript import (
+    CONFIRM_LAG_SECONDS,
+    _remainder_after_overlap,
+    merge_segments,
+    offset_segments,
+    prompt_context,
+)
 
 
 def seg(start, end, text):
@@ -55,18 +61,57 @@ def test_confirmed_text_is_appended_not_rewritten_across_passes():
     assert second.tentative_text == "today"
 
 
-def test_overlapping_segment_across_boundary_is_not_duplicated():
-    # A re-decoded pass splits the words differently near the old boundary
-    # (segment now starts before confirmed_until) — it must not be re-added.
+def test_overlapping_segment_across_boundary_recovers_the_new_words():
+    # A re-decoded pass splits the words differently near the old boundary:
+    # "there friend" now starts before confirmed_until (re-stating the
+    # already-confirmed "there") but ends after it (introducing the new
+    # word "friend"). The overlapping "there" must not be duplicated, but
+    # "friend" is genuinely new and must not be silently lost either.
     confirmed_until = 2.0
     segments = [seg(1.8, 2.6, "there friend"), seg(2.6, 4.0, "today")]
     result = merge_segments(
         segments, confirmed_text="hello there", confirmed_until=confirmed_until, duration=6.0,
     )
-    # "there friend" starts before confirmed_until so it's skipped entirely;
-    # only "today" (fully past the boundary) gets confirmed.
-    assert result.confirmed_text == "hello there today"
-    assert "there friend" not in result.confirmed_text
+    assert result.confirmed_text == "hello there friend today"
+    # the overlapping word appears exactly once, not duplicated
+    assert result.confirmed_text.split().count("there") == 1
+
+
+def test_straddling_segment_with_no_wording_overlap_keeps_full_text():
+    # If the overlapping time range was re-transcribed with completely
+    # different wording (no matching prefix at all), there's no safe way to
+    # tell which part is "old" — keep the whole segment rather than risk
+    # silently dropping new content. An occasional duplicated word is a far
+    # smaller problem for a transcription product than vanished speech.
+    segments = [seg(1.8, 3.0, "completely different wording")]
+    result = merge_segments(
+        segments, confirmed_text="hello there", confirmed_until=2.0, duration=6.0,
+    )
+    assert result.confirmed_text == "hello there completely different wording"
+
+
+def test_straddling_segment_fully_covered_by_confirmed_text_adds_nothing():
+    # The straddling segment's words are entirely a re-statement of what's
+    # already confirmed (nothing new past the overlap) — advance the
+    # boundary but don't append an empty remainder.
+    segments = [seg(1.0, 2.0, "there"), seg(2.0, 3.0, "friend")]
+    result = merge_segments(
+        segments, confirmed_text="hello there", confirmed_until=1.5, duration=6.0,
+    )
+    assert result.confirmed_text == "hello there friend"
+    assert result.confirmed_until == 3.0
+
+
+def test_remainder_after_overlap_strips_matching_prefix_case_and_punctuation_insensitively():
+    assert _remainder_after_overlap("hello There,", "there friend") == "friend"
+
+
+def test_remainder_after_overlap_with_no_match_returns_full_text():
+    assert _remainder_after_overlap("hello there", "completely different") == "completely different"
+
+
+def test_remainder_after_overlap_full_duplicate_returns_empty():
+    assert _remainder_after_overlap("hello there friend", "there friend") == ""
 
 
 def test_out_of_order_segments_are_sorted_before_joining():
@@ -149,3 +194,27 @@ def test_confirm_lag_zero_flushes_everything_pending():
 def test_confirmed_segments_defaults_to_empty_list():
     result = merge_segments([seg(0.0, 1.0, "hi")], confirmed_text="", confirmed_until=0.0, duration=10.0)
     assert result.confirmed_segments == [seg(0.0, 1.0, "hi")]
+
+
+def test_prompt_context_empty_for_no_confirmed_text():
+    assert prompt_context("") == ""
+    assert prompt_context("   ") == ""
+
+
+def test_prompt_context_returns_short_text_unchanged():
+    assert prompt_context("hello there") == "hello there"
+
+
+def test_prompt_context_truncates_and_drops_leading_partial_word():
+    # max_chars=10 lands mid-word inside "brown" (chars [-10:] = "n fox jump");
+    # the leading fragment "n" must be dropped, not kept as a fake word.
+    text = "the quick brown fox jump"
+    result = prompt_context(text, max_chars=10)
+    assert result == "fox jump"
+
+
+def test_prompt_context_does_not_cut_a_word_in_half():
+    text = "the quick brown fox jumps over the lazy dog"
+    result = prompt_context(text, max_chars=10)
+    # every word in the trimmed prompt must be a whole word from the source
+    assert all(word in text.split() for word in result.split())

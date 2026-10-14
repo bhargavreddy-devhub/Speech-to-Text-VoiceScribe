@@ -45,8 +45,19 @@ def get_model():
     return _model
 
 
-def transcribe_file(wav_path: Path, language: Optional[str] = None, beam_size: int = 5):
+def transcribe_file(
+    wav_path: Path,
+    language: Optional[str] = None,
+    beam_size: int = 5,
+    initial_prompt: Optional[str] = None,
+):
     """Run ASR on a preprocessed WAV file.
+
+    `initial_prompt` seeds Whisper's decoder with prior context (e.g. the
+    already-confirmed text from earlier in a live session) without that audio
+    being re-transcribed. This is what keeps spelling/capitalization/style
+    consistent and disambiguates homophones across windows in a sliding-window
+    live session, where each pass otherwise has no memory of previous passes.
 
     Returns (full_text, segments, detected_language) where segments is a
     list of {start, end, text} dicts.
@@ -58,6 +69,7 @@ def transcribe_file(wav_path: Path, language: Optional[str] = None, beam_size: i
         language=language,
         vad_filter=True,
         beam_size=beam_size,
+        initial_prompt=initial_prompt or None,
     )
 
     segments = []

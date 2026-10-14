@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiFetch, apiJson, API_BASE } from '../lib/apiClient';
 import { useAuthStore } from '../store/authStore';
@@ -144,27 +144,39 @@ export function useFileUpload() {
     queryKey: ['transcript', uploadedId],
     queryFn: () => apiJson<TranscriptDetail>(`/transcripts/${uploadedId}`),
     enabled: !!uploadedId,
+    // Must stay a pure function of query state only (no setState calls here):
+    // it's a fresh closure every render, so TanStack Query re-invoking it on
+    // render churn — not just on actual poll ticks — previously called
+    // setStatus unconditionally once the status went terminal, which fed
+    // back into another render and looped ("Maximum update depth exceeded").
     refetchInterval: (query) => {
       const data = query.state.data as TranscriptDetail | undefined;
       if (!data) return 2000;
       if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
-        if (data.status === 'completed') {
-          setStatus({ kind: 'success', message: 'Done — see the result below.' });
-        } else if (data.status === 'failed') {
-          setStatus({ kind: 'error', message: `Failed: ${data.error_message || 'unknown error'}` });
-        } else {
-          setStatus({ kind: 'error', message: 'Cancelled.' });
-        }
         return false;
       }
       attemptsRef.current += 1;
-      if (attemptsRef.current > 150) {
-        setStatus({ kind: 'error', message: 'Still processing — check History later.' });
-        return false;
-      }
-      return 2000;
+      return attemptsRef.current > 150 ? false : 2000;
     },
   });
+
+  // Reacts to actual data changes only (object identity changes on real
+  // fetches, not on unrelated re-renders), so this can't loop the way the
+  // old in-refetchInterval setState calls did.
+  useEffect(() => {
+    const data = pollQuery.data;
+    if (!data) return;
+    if (data.status === 'completed') {
+      setStatus({ kind: 'success', message: 'Done — see the result below.' });
+    } else if (data.status === 'failed') {
+      setStatus({ kind: 'error', message: `Failed: ${data.error_message || 'unknown error'}` });
+    } else if (data.status === 'cancelled') {
+      setStatus({ kind: 'error', message: 'Cancelled.' });
+    } else if (attemptsRef.current > 150) {
+      setStatus({ kind: 'error', message: 'Still processing — check History later.' });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pollQuery.data]);
 
   return {
     pendingFiles,

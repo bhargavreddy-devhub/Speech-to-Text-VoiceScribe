@@ -1,7 +1,8 @@
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from deep_translator import MyMemoryTranslator
+import requests
 
 # MyMemory requires region-qualified locale codes rather than bare ISO-639-1
 # codes (e.g. "hi-IN" instead of "hi"), and its "auto" source detection is
@@ -45,6 +46,15 @@ TARGET_LOCALE_MAP = {
 }
 
 _MAX_CHUNK_CHARS = 450
+_MYMEMORY_URL = "http://api.mymemory.translated.net/get"
+# MyMemory's free endpoint is a slow, rate-limited third-party service (easily
+# 1-5s per request) with no built-in timeout, so a hung request would otherwise
+# block the background transcription task indefinitely.
+_REQUEST_TIMEOUT_SECONDS = 15
+# Chunks are independent network calls, so translating them concurrently turns
+# N sequential round-trips (N * ~2-5s) into roughly one round-trip's worth of
+# wall-clock time for multi-chunk transcripts.
+_MAX_CONCURRENT_REQUESTS = 4
 
 
 def _split_into_chunks(text: str, max_chars: int = _MAX_CHUNK_CHARS) -> list[str]:
@@ -69,6 +79,37 @@ class TranslationError(Exception):
     pass
 
 
+def _translate_chunk(chunk: str, source_locale: str, target_locale: str) -> str:
+    try:
+        response = requests.get(
+            _MYMEMORY_URL,
+            params={"q": chunk, "langpair": f"{source_locale}|{target_locale}"},
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise TranslationError(f"Translation service request failed: {exc}") from exc
+
+    if response.status_code == 429:
+        raise TranslationError("Translation service rate limit exceeded, try again shortly")
+    if response.status_code >= 400:
+        raise TranslationError(f"Translation service returned HTTP {response.status_code}")
+
+    data = response.json()
+    result = (data.get("responseData") or {}).get("translatedText")
+    if result and "INVALID SOURCE LANGUAGE" in result.upper():
+        raise TranslationError(f"Translation service rejected the request: {result}")
+    if not result:
+        # MyMemory sometimes returns an empty translatedText (its best cached
+        # "match" happens to be blank) while still providing a real machine
+        # translation further down in `matches` — fall back to that.
+        for match in data.get("matches") or []:
+            candidate = match.get("translation")
+            if candidate:
+                return candidate
+        raise TranslationError("Translation service returned an empty result")
+    return result
+
+
 def translate_text(text: str, target_code: str, source_code: Optional[str] = None) -> str:
     """Translate text into the given short language code (e.g. 'hi', 'es').
 
@@ -88,14 +129,15 @@ def translate_text(text: str, target_code: str, source_code: Optional[str] = Non
 
     source_locale = TARGET_LOCALE_MAP.get(source_code or "en", TARGET_LOCALE_MAP["en"])
 
+    chunks = _split_into_chunks(text)
     try:
-        translator = MyMemoryTranslator(source=source_locale, target=target_locale)
-        translated_chunks = []
-        for chunk in _split_into_chunks(text):
-            result = translator.translate(chunk)
-            if result is None or "INVALID SOURCE LANGUAGE" in result.upper():
-                raise TranslationError(f"Translation service rejected the request: {result}")
-            translated_chunks.append(result)
+        if len(chunks) == 1:
+            translated_chunks = [_translate_chunk(chunks[0], source_locale, target_locale)]
+        else:
+            with ThreadPoolExecutor(max_workers=min(_MAX_CONCURRENT_REQUESTS, len(chunks))) as pool:
+                translated_chunks = list(
+                    pool.map(lambda c: _translate_chunk(c, source_locale, target_locale), chunks)
+                )
         return " ".join(part for part in translated_chunks if part)
     except TranslationError:
         raise

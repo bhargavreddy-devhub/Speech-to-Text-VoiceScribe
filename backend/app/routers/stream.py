@@ -10,7 +10,7 @@ from ..config import settings
 from ..database import SessionLocal
 from ..models import Transcript
 from ..services.audio_processing import AudioProcessingError, convert_to_wav, get_duration_seconds
-from ..services.live_transcript import WINDOW_SECONDS, merge_segments, offset_segments
+from ..services.live_transcript import WINDOW_SECONDS, merge_segments, offset_segments, prompt_context
 from ..services.whisper_service import transcribe_file
 
 router = APIRouter(tags=["stream"])
@@ -61,7 +61,12 @@ async def stream_transcribe(websocket: WebSocket):
                 # Cheap format probe on the raw container — avoids a full
                 # ffmpeg transcode of the whole recording just to learn its
                 # length, and doubles as an "enough data yet?" gate.
-                duration = get_duration_seconds(raw_path)
+                # assume_unfinalized=True: this file is still being appended
+                # to, so its container-level duration field (if any) can't be
+                # trusted to match the bytes actually present — a stale value
+                # here desyncs confirmed_until from the real audio edge and
+                # permanently drops real speech from merge_segments.
+                duration = get_duration_seconds(raw_path, assume_unfinalized=True)
                 if duration <= 0:
                     continue
 
@@ -75,9 +80,14 @@ async def stream_transcribe(websocket: WebSocket):
                         tail_seconds=WINDOW_SECONDS if window_start > 0 else None,
                     )
                     # beam_size=1 (greedy) keeps partial passes fast and
-                    # deterministic for a given audio window.
+                    # deterministic for a given audio window. initial_prompt
+                    # gives the decoder the tail of what's already confirmed,
+                    # so it starts the window with context instead of cold —
+                    # fewer boundary mistranscriptions and more consistent
+                    # spelling/capitalization across passes.
                     _, segments, detected_lang = transcribe_file(
-                        wav_path, language=language, beam_size=1
+                        wav_path, language=language, beam_size=1,
+                        initial_prompt=prompt_context(confirmed_text),
                     )
                     consecutive_failures = 0
                 except AudioProcessingError:
@@ -134,7 +144,9 @@ async def stream_transcribe(websocket: WebSocket):
         duration = confirmed_until
         if raw_path.exists():
             try:
-                total_duration = get_duration_seconds(raw_path)
+                # Same reasoning as the live-loop probe above: this is still
+                # the raw, never-finalized recording file.
+                total_duration = get_duration_seconds(raw_path, assume_unfinalized=True)
                 remaining = max(0.0, total_duration - confirmed_until)
                 t_audio_done = time.monotonic()
 
@@ -149,7 +161,10 @@ async def stream_transcribe(websocket: WebSocket):
                     offset = max(0.0, total_duration - window_duration)
                     t_audio_done = time.monotonic()
 
-                    _, tail_segments, final_lang = transcribe_file(wav_path, language=language)
+                    _, tail_segments, final_lang = transcribe_file(
+                        wav_path, language=language,
+                        initial_prompt=prompt_context(confirmed_text),
+                    )
                     abs_tail_segments = offset_segments(tail_segments, offset)
 
                     # confirm_lag_seconds=0: nothing more is coming, so flush

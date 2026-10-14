@@ -28,10 +28,13 @@ def convert_to_wav(
         # size is still "unknown" — exactly what the browser's MediaRecorder
         # writes for a recording still in progress (ffmpeg logs "Cannot use
         # -sseof, file duration not known" and silently decodes from the
-        # start instead). Compute the start offset ourselves — our own
-        # duration probe already has a packet-scan fallback for this case —
-        # and seek with plain `-ss`, which works regardless.
-        total_duration = get_duration_seconds(input_path)
+        # start instead). Compute the start offset ourselves and seek with
+        # plain `-ss`, which works regardless. `tail_seconds` is only ever
+        # passed for this still-growing live recording, so this probe must
+        # never trust the container's self-reported duration field (it can
+        # be stale/inconsistent with the bytes actually present) — always
+        # measure from real packet timestamps instead.
+        total_duration = get_duration_seconds(input_path, assume_unfinalized=True)
         start = max(0.0, total_duration - tail_seconds)
         if start > 0:
             seek_args = ["-ss", str(start)]
@@ -60,7 +63,52 @@ def convert_to_wav(
             )
 
 
-def get_duration_seconds(path: Path) -> float:
+def _last_packet_end_seconds(path: Path) -> float:
+    """Cheap metadata-only demux (no audio decode) that measures duration from
+    the last audio packet's own timestamp, rather than trusting the
+    container's self-reported duration field."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "packet=pts_time,duration_time",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    last_end = 0.0
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            pts_time, duration_time = float(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        last_end = max(last_end, pts_time + duration_time)
+    return last_end
+
+
+def get_duration_seconds(path: Path, assume_unfinalized: bool = False) -> float:
+    """Measure a media file's duration in seconds.
+
+    `assume_unfinalized=True` (used for the live-stream endpoint's raw
+    recording, which it overwrites every ~2s while still growing) skips
+    straight to the packet-timestamp method below and never trusts the
+    container's self-reported duration field. That field is normally unset
+    for a WebM whose Segment size is "unknown" — exactly what the browser's
+    MediaRecorder writes for a recording still in progress — in which case
+    the container probe below already falls back to it. But a container that
+    *does* carry a duration field can't be assumed to have one that matches
+    the bytes actually present: ffmpeg/the recorder may embed a duration
+    computed before the stream was truncated or is still being appended to,
+    which silently desyncs the live merge logic's confirmed/tentative
+    boundary from where the real audio edge is — the only symptom is already-
+    spoken words quietly never making it into the transcript, so this isn't
+    a corner worth cutting for the sake of one ffprobe call.
+    """
+    if assume_unfinalized:
+        return _last_packet_end_seconds(path)
+
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -73,31 +121,7 @@ def get_duration_seconds(path: Path) -> float:
     except (ValueError, AttributeError):
         pass
 
-    # The container-level duration is unset for a WebM whose Segment size is
-    # still "unknown" — exactly what the browser's MediaRecorder writes for a
-    # recording that hasn't been finalized yet (our live-stream endpoint
-    # overwrites this same growing file on every chunk). Fall back to the
-    # last audio packet's own timestamp: still a cheap metadata-only demux
-    # (no audio decode), unlike a full transcode.
-    fallback_cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a:0",
-        "-show_entries", "packet=pts_time,duration_time",
-        "-of", "csv=p=0",
-        str(path),
-    ]
-    fallback = subprocess.run(fallback_cmd, capture_output=True, text=True)
-    last_end = 0.0
-    for line in fallback.stdout.splitlines():
-        parts = line.strip().split(",")
-        if len(parts) < 2:
-            continue
-        try:
-            pts_time, duration_time = float(parts[0]), float(parts[1])
-        except ValueError:
-            continue
-        last_end = max(last_end, pts_time + duration_time)
-    return last_end
+    return _last_packet_end_seconds(path)
 
 
 def extract_chunk(

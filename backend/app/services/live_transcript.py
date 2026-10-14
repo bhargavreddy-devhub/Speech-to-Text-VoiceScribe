@@ -20,6 +20,71 @@ CONFIRM_LAG_SECONDS = 2.0
 # been running.
 WINDOW_SECONDS = 20.0
 
+# How much of the confirmed transcript to feed back to Whisper as context for
+# the next pass. Each pass otherwise starts "cold" with no memory of what was
+# just said, which costs consistent spelling/capitalization and correct
+# homophone choices right at the start of the window. Kept short so it
+# nudges the decoder rather than dominating the prompt budget.
+PROMPT_CONTEXT_CHARS = 200
+
+
+def prompt_context(confirmed_text: str, max_chars: int = PROMPT_CONTEXT_CHARS) -> str:
+    """Return a trailing slice of `confirmed_text` suitable as an initial_prompt.
+
+    Trims to the last `max_chars` characters, then drops any partial leading
+    word (cut mid-word by the slice) so the prompt reads as whole words -
+    Whisper's prompting is sensitive to being handed a token fragment.
+    """
+    tail = confirmed_text.strip()[-max_chars:]
+    if not tail:
+        return ""
+    first_space = tail.find(" ")
+    if first_space > 0 and len(confirmed_text.strip()) > max_chars:
+        tail = tail[first_space + 1 :]
+    return tail.strip()
+
+
+def _normalize_word(word: str) -> str:
+    return word.strip(".,!?;:\"'()[]{}—-").lower()
+
+
+# How many trailing confirmed words to search for an overlap match against a
+# straddling segment. Bounded for both performance and correctness — a
+# "match" found much further back than a typical segment's length would be
+# coincidental rather than real overlap.
+_OVERLAP_SEARCH_WORDS = 30
+
+
+def _remainder_after_overlap(confirmed_text: str, segment_text: str) -> str:
+    """A segment that straddles the confirmed boundary (it starts before
+    `confirmed_until` but extends past it) is almost always a re-decode of
+    some already-confirmed words followed by genuinely new ones — re-decoded
+    because a later pass, with more audio and context, grouped the ASR
+    output into different segment boundaries than the pass that confirmed
+    the earlier words did. Find the longest run of trailing confirmed words
+    that matches a leading run of the segment's words, and return only what
+    comes after that overlap.
+
+    If no overlap is found at all (wording actually differs across the
+    straddle, not just re-segmentation), returns `segment_text` unchanged
+    rather than silently discarding it — for a transcription product, a
+    rare duplicated word is a far smaller problem than new speech vanishing
+    with no trace, which is what skipping the segment entirely would do.
+    """
+    confirmed_words = confirmed_text.split()[-_OVERLAP_SEARCH_WORDS:]
+    segment_words = segment_text.split()
+    if not confirmed_words or not segment_words:
+        return segment_text
+
+    confirmed_norm = [_normalize_word(w) for w in confirmed_words]
+    segment_norm = [_normalize_word(w) for w in segment_words]
+
+    for n in range(min(len(confirmed_norm), len(segment_norm)), 0, -1):
+        if confirmed_norm[-n:] == segment_norm[:n]:
+            return " ".join(segment_words[n:])
+
+    return segment_text
+
 
 @dataclass
 class MergeResult:
@@ -41,12 +106,19 @@ def merge_segments(
 
     `segments` are absolute-timeline {start, end, text} dicts (offset-adjusted
     by the caller if they came from a trailing window rather than the full
-    recording). A segment is locked into `confirmed_text` only once it ends
-    at least `confirm_lag_seconds` before the current audio edge *and* starts
-    at or after the existing confirmed boundary — the first condition gives
-    Whisper room to still revise it, the second prevents a segment that
-    straddles the boundary differently across passes from duplicating words
-    already confirmed. Confirmed text is never rewritten, only appended to.
+    recording). A segment is locked into `confirmed_text` once it ends at
+    least `confirm_lag_seconds` before the current audio edge, giving Whisper
+    room to still revise it right up until then. Confirmed text is never
+    rewritten, only appended to.
+
+    Segmentation isn't stable across passes — a later pass (more audio, more
+    context) can group words into different segment boundaries than an
+    earlier pass did, so a segment can straddle `confirmed_until` (start
+    before it, end after): partly already confirmed, partly new. Such a
+    segment is matched against the tail of `confirmed_text` via
+    `_remainder_after_overlap` and only its new portion is appended, instead
+    of either re-adding the overlapping words (duplication) or dropping the
+    segment outright (silently losing the new words in it too).
 
     `confirmed_segments` carries forward the individual segments locked in by
     earlier passes (not just their joined text), so a caller finalizing the
@@ -58,20 +130,26 @@ def merge_segments(
     confirmed_segments = list(confirmed_segments) if confirmed_segments else []
     safe_boundary = max(0.0, duration - confirm_lag_seconds)
 
-    newly_confirmed = sorted(
-        (
-            seg for seg in segments
-            if seg["end"] <= safe_boundary and seg["start"] >= confirmed_until - 1e-6
-        ),
+    old_enough = sorted(
+        (seg for seg in segments if seg["end"] <= safe_boundary),
         key=lambda seg: seg["start"],
     )
 
-    if newly_confirmed:
-        pieces = [seg["text"].strip() for seg in newly_confirmed if seg["text"].strip()]
-        if pieces:
-            confirmed_text = (confirmed_text + " " + " ".join(pieces)).strip()
-        confirmed_segments.extend(newly_confirmed)
-        confirmed_until = max(confirmed_until, max(seg["end"] for seg in newly_confirmed))
+    new_pieces = []
+    for seg in old_enough:
+        if seg["end"] <= confirmed_until + 1e-6:
+            continue  # fully covered by what's already confirmed — nothing new here
+
+        text = seg["text"].strip()
+        if text and seg["start"] < confirmed_until - 1e-6:
+            # Straddles the boundary — only part of it is new.
+            text = _remainder_after_overlap(confirmed_text, text).strip()
+
+        if text:
+            new_pieces.append(text)
+            confirmed_text = (confirmed_text + " " + text).strip()
+        confirmed_segments.append(seg)
+        confirmed_until = max(confirmed_until, seg["end"])
 
     tentative_text = " ".join(
         seg["text"].strip() for seg in segments

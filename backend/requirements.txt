@@ -9,7 +9,7 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 faster-whisper==1.2.1
-deep-translator==1.11.4
+requests==2.34.2
 reportlab==4.2.5
 python-docx==1.1.2
 aiofiles==24.1.0
